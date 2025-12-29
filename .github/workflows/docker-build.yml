@@ -1,0 +1,1019 @@
+name: Build and Deploy Container
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: nov29
+  REGISTRY: us-central1-docker.pkg.dev
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if source code already imported
+        id: check-import
+        run: |
+          # Check if src/ or package.json exists (indicating source already imported)
+          if [ -f "package.json" ] || [ -f "pyproject.toml" ] || [ -f "Cargo.toml" ] || [ -f "go.mod" ] || [ -d "src" ]; then
+            echo "SOURCE_IMPORTED=true" >> $GITHUB_OUTPUT
+            echo "Source code already imported, skipping clone"
+          else
+            echo "SOURCE_IMPORTED=false" >> $GITHUB_OUTPUT
+            echo "Source code not yet imported, will clone from upstream"
+          fi
+
+      - name: Clone original source repository
+        if: steps.check-import.outputs.SOURCE_IMPORTED == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ddsky/world-news-api-clients
+          ref: main
+          path: upstream-source
+
+      - name: Import source code to repository
+        if: steps.check-import.outputs.SOURCE_IMPORTED == 'false'
+        run: |
+          echo "=== Importing source code from ddsky/world-news-api-clients ==="
+          
+          # Copy all source files (excluding .git and .github to avoid workflow permission issues)
+          cd upstream-source
+          find . -maxdepth 1 ! -name '.' ! -name '.git' ! -name '.github' -exec cp -r {} ../ \;
+          cd ..
+          
+          # Remove the upstream-source directory
+          rm -rf upstream-source
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Commit the source code
+          git add -A
+          IMPORT_DATE=$(date -u +%Y-%m-%d)
+          git commit -m "feat: Import source from ddsky/world-news-api-clients" -m "Branch: main, Date: $IMPORT_DATE"
+          
+          # Push the commit
+          git push origin main
+          
+          echo "=== Source code imported successfully ==="
+
+      - name: Detect Dockerfile or generate fallback
+        id: dockerfile
+        run: |
+          echo "=== Checking for Dockerfile ==="
+          
+          if [ -f "Dockerfile" ]; then
+            echo "DOCKERFILE_SOURCE=existing" >> $GITHUB_OUTPUT
+            echo "Using existing Dockerfile from source repository"
+            cat Dockerfile
+          else
+            echo "DOCKERFILE_SOURCE=generated" >> $GITHUB_OUTPUT
+            echo "No Dockerfile found, generating fallback..."
+            
+            if [ -f "package.json" ]; then
+              echo "Detected: Node.js project"
+              
+              MAIN=$(jq -r '.main // "index.js"' package.json 2>/dev/null || echo "index.js")
+              HAS_BUILD=$(jq -r '.scripts.build // empty' package.json 2>/dev/null)
+              HAS_START=$(jq -r '.scripts.start // empty' package.json 2>/dev/null)
+              
+              if [ -f "pnpm-lock.yaml" ]; then
+                PKG_MGR="pnpm"
+                {
+                  echo "FROM node:20-alpine"
+                  echo "WORKDIR /app"
+                  echo "RUN corepack enable"
+                  echo "COPY package.json pnpm-lock.yaml ./"
+                  echo "RUN pnpm install --frozen-lockfile"
+                  echo "COPY . ."
+                  if [ -n "$HAS_BUILD" ]; then echo "RUN pnpm run build"; fi
+                  if [ -n "$HAS_START" ]; then echo 'CMD ["pnpm", "start"]'
+                  else echo "CMD [\"node\", \"$MAIN\"]"; fi
+                } > Dockerfile
+              elif [ -f "yarn.lock" ]; then
+                PKG_MGR="yarn"
+                # Yarn Berry (v2+) requires all files including .yarn dir for install
+                {
+                  echo "FROM node:20-alpine"
+                  echo "WORKDIR /app"
+                  echo "RUN corepack enable"
+                  echo "COPY . ."
+                  echo "RUN yarn install --immutable"
+                  if [ -n "$HAS_BUILD" ]; then echo "RUN yarn build"; fi
+                  if [ -n "$HAS_START" ]; then echo 'CMD ["yarn", "start"]'
+                  else echo "CMD [\"node\", \"$MAIN\"]"; fi
+                } > Dockerfile
+              elif [ -f "bun.lockb" ]; then
+                PKG_MGR="bun"
+                {
+                  echo "FROM oven/bun:latest"
+                  echo "WORKDIR /app"
+                  echo "COPY package.json bun.lockb ./"
+                  echo "RUN bun install --frozen-lockfile"
+                  echo "COPY . ."
+                  if [ -n "$HAS_BUILD" ]; then echo "RUN bun run build"; fi
+                  if [ -n "$HAS_START" ]; then echo 'CMD ["bun", "start"]'
+                  else echo "CMD [\"bun\", \"$MAIN\"]"; fi
+                } > Dockerfile
+              else
+                PKG_MGR="npm"
+                {
+                  echo "FROM node:20-alpine"
+                  echo "WORKDIR /app"
+                  echo "COPY package*.json ./"
+                  echo "RUN npm ci || npm install"
+                  echo "COPY . ."
+                  if [ -n "$HAS_BUILD" ]; then echo "RUN npm run build"; fi
+                  if [ -n "$HAS_START" ]; then echo 'CMD ["npm", "start"]'
+                  else echo "CMD [\"node\", \"$MAIN\"]"; fi
+                } > Dockerfile
+              fi
+              
+            elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+              echo "Detected: Python project"
+              
+              if [ -f "main.py" ]; then ENTRY="main.py"
+              elif [ -f "app.py" ]; then ENTRY="app.py"
+              elif [ -f "server.py" ]; then ENTRY="server.py"
+              else ENTRY="main.py"; fi
+              
+              {
+                echo "FROM python:3.11-slim"
+                echo "WORKDIR /app"
+                echo "COPY requirements.txt* pyproject.toml* ./"
+                # Install from requirements.txt if exists, otherwise from pyproject.toml
+                # Don't hide errors with 2>/dev/null or || true
+                if [ -f "requirements.txt" ]; then
+                  echo "RUN pip install --no-cache-dir -r requirements.txt"
+                elif [ -f "pyproject.toml" ]; then
+                  echo "RUN pip install --no-cache-dir ."
+                fi
+                echo "COPY . ."
+                echo "CMD [\"python\", \"$ENTRY\"]"
+              } > Dockerfile
+              
+            elif [ -f "go.mod" ]; then
+              echo "Detected: Go project"
+              {
+                echo "FROM golang:1.21-alpine AS builder"
+                echo "WORKDIR /app"
+                echo "COPY go.mod go.sum* ./"
+                echo "RUN go mod download"
+                echo "COPY . ."
+                echo "RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server ."
+                echo "FROM alpine:latest"
+                echo "WORKDIR /app"
+                echo 'COPY --from=builder /app/server .'
+                echo 'CMD ["./server"]'
+              } > Dockerfile
+              
+            elif [ -f "Cargo.toml" ]; then
+              echo "Detected: Rust project"
+              {
+                echo "FROM rust:1.75-alpine AS builder"
+                echo "RUN apk add --no-cache musl-dev"
+                echo "WORKDIR /app"
+                echo "COPY . ."
+                echo "RUN cargo build --release"
+                echo "FROM alpine:latest"
+                echo "WORKDIR /app"
+                echo 'COPY --from=builder /app/target/release/* ./'
+                echo 'CMD ["./app"]'
+              } > Dockerfile
+              
+            else
+              echo "Unknown project type, creating minimal Dockerfile"
+              {
+                echo "FROM alpine:latest"
+                echo "WORKDIR /app"
+                echo "COPY . ."
+                echo 'CMD ["/bin/sh", "-c", "echo Container started"]'
+              } > Dockerfile
+            fi
+            
+            echo "=== Generated Dockerfile ==="
+            cat Dockerfile
+          fi
+          echo "=== Build ready ==="
+
+      - name: Generate FastMCP wrapper for API client library
+        run: |
+          echo "=== Generating FastMCP wrapper for worldnewsapi ==="
+          
+          # Check if main.py already exists with FastMCP
+          if [ -f "main.py" ] && grep -q "fastmcp\|FastMCP" main.py; then
+            echo "Custom FastMCP wrapper already exists, skipping generation"
+          else
+            # Generate main.py FastMCP wrapper using echo commands
+            echo "#!/usr/bin/env python3" > main.py
+            echo '"""MCP server wrapping worldnewsapi API client."""' >> main.py
+            echo "" >> main.py
+            echo "import os" >> main.py
+            echo "import inspect" >> main.py
+            echo "import logging" >> main.py
+            echo "import types" >> main.py
+            echo "from typing import Any" >> main.py
+            echo "" >> main.py
+            echo "from fastmcp import FastMCP" >> main.py
+            echo "" >> main.py
+            echo "logging.basicConfig(level=logging.INFO)" >> main.py
+            echo "logger = logging.getLogger(__name__)" >> main.py
+            echo "" >> main.py
+            echo 'mcp = FastMCP("world-news-api-clients", stateless_http=True)' >> main.py
+            echo "" >> main.py
+            echo 'API_KEY = os.environ.get("API_KEY", "")' >> main.py
+            echo "" >> main.py
+            echo "# Fallback status tool always available" >> main.py
+            echo "@mcp.tool" >> main.py
+            echo "def get_server_status() -> str:" >> main.py
+            echo '    """Get the status of this MCP server."""' >> main.py
+            echo '    return "MCP server for worldnewsapi is running"' >> main.py
+            echo "" >> main.py
+            echo "def get_openapi_clients(client_module):" >> main.py
+            echo '    """Handle OpenAPI-generated client libraries like worldnewsapi."""' >> main.py
+            echo "    if not hasattr(client_module, 'Configuration') or not hasattr(client_module, 'ApiClient'):" >> main.py
+            echo "        return []" >> main.py
+            echo "    " >> main.py
+            echo "    try:" >> main.py
+            echo "        config = client_module.Configuration()" >> main.py
+            echo "        # Try common API key patterns" >> main.py
+            echo "        if hasattr(config, 'api_key') and isinstance(config.api_key, dict):" >> main.py
+            echo "            for key_name in ['apiKey', 'api_key', 'headerApiKey', 'x-api-key']:" >> main.py
+            echo "                config.api_key[key_name] = API_KEY" >> main.py
+            echo "        " >> main.py
+            echo "        api_client = client_module.ApiClient(config)" >> main.py
+            echo "        " >> main.py
+            echo "        # Find all API classes (end with 'Api')" >> main.py
+            echo "        api_instances = []" >> main.py
+            echo "        for name in dir(client_module):" >> main.py
+            echo "            if name.endswith('Api') and name != 'ApiClient':" >> main.py
+            echo "                ApiClass = getattr(client_module, name)" >> main.py
+            echo "                if isinstance(ApiClass, type):" >> main.py
+            echo "                    try:" >> main.py
+            echo "                        api_instance = ApiClass(api_client)" >> main.py
+            echo "                        api_instances.append((name, api_instance))" >> main.py
+            echo '                        logger.info(f"Initialized OpenAPI class: {name}")' >> main.py
+            echo "                    except Exception as e:" >> main.py
+            echo '                        logger.debug(f"Failed to init {name}: {e}")' >> main.py
+            echo "        " >> main.py
+            echo "        return api_instances" >> main.py
+            echo "    except Exception as e:" >> main.py
+            echo '        logger.error(f"OpenAPI client init failed: {e}")' >> main.py
+            echo "        return []" >> main.py
+            echo "" >> main.py
+            echo "def get_client():" >> main.py
+            echo "    try:" >> main.py
+            echo "        import worldnewsapi as client_module" >> main.py
+            echo "        " >> main.py
+            echo "        # Try OpenAPI pattern first (Configuration + ApiClient)" >> main.py
+            echo "        openapi_instances = get_openapi_clients(client_module)" >> main.py
+            echo "        if openapi_instances:" >> main.py
+            echo "            # Return first API instance, store others globally" >> main.py
+            echo "            global _all_api_instances" >> main.py
+            echo "            _all_api_instances = openapi_instances" >> main.py
+            echo "            return openapi_instances[0][1]" >> main.py
+            echo "        " >> main.py
+            echo "        client_classes = ['Client', 'ApiClient', 'API', 'Worldnewsapi', 'WorldnewsapiClient', 'WorldnewsapiApi']" >> main.py
+            echo "        " >> main.py
+            echo "        for class_name in client_classes:" >> main.py
+            echo "            if hasattr(client_module, class_name):" >> main.py
+            echo "                ClientClass = getattr(client_module, class_name)" >> main.py
+            echo "                if not isinstance(ClientClass, type):" >> main.py
+            echo "                    continue" >> main.py
+            echo "                try:" >> main.py
+            echo "                    return ClientClass(api_key=API_KEY)" >> main.py
+            echo "                except Exception:" >> main.py
+            echo "                    try:" >> main.py
+            echo "                        return ClientClass(API_KEY)" >> main.py
+            echo "                    except Exception:" >> main.py
+            echo "                        try:" >> main.py
+            echo "                            return ClientClass()" >> main.py
+            echo "                        except Exception:" >> main.py
+            echo "                            continue" >> main.py
+            echo "        " >> main.py
+            echo "        # Fall back to module itself for module-level callables" >> main.py
+            echo "        return client_module" >> main.py
+            echo "        " >> main.py
+            echo "    except ImportError as e:" >> main.py
+            echo '        logger.error(f"Failed to import worldnewsapi: {e}")' >> main.py
+            echo "        return None" >> main.py
+            echo "" >> main.py
+            echo "_all_api_instances = []" >> main.py
+            echo "" >> main.py
+            echo "def is_api_method(obj, name):" >> main.py
+            echo '    """Check if an attribute is a real API method, not a config property."""' >> main.py
+            echo "    # Skip private/magic methods" >> main.py
+            echo "    if name.startswith('_'):" >> main.py
+            echo "        return False" >> main.py
+            echo "    " >> main.py
+            echo "    # Skip methods ending with _with_http_info (OpenAPI pattern)" >> main.py
+            echo "    if name.endswith('_with_http_info'):" >> main.py
+            echo "        return False" >> main.py
+            echo "    " >> main.py
+            echo "    if not callable(obj):" >> main.py
+            echo "        return False" >> main.py
+            echo "    if isinstance(obj, type):" >> main.py
+            echo "        return False" >> main.py
+            echo "    " >> main.py
+            echo "    skip_names = {'copy', 'keys', 'values', 'items', 'get', 'pop', 'update', 'clear'," >> main.py
+            echo "                  'setdefault', 'fromkeys', 'to_dict', 'to_str', 'from_dict'," >> main.py
+            echo "                  'validate', 'model_dump', 'model_validate', 'dict', 'json'," >> main.py
+            echo "                  'parse_obj', 'parse_raw', 'schema', 'schema_json', 'construct'}" >> main.py
+            echo "    if name in skip_names:" >> main.py
+            echo "        return False" >> main.py
+            echo "    " >> main.py
+            echo "    # Check if it looks like a method (has signature)" >> main.py
+            echo "    try:" >> main.py
+            echo "        sig = inspect.signature(obj)" >> main.py
+            echo "        # Must have at least self parameter for bound methods" >> main.py
+            echo "        return True" >> main.py
+            echo "    except (ValueError, TypeError):" >> main.py
+            echo "        # If we cant get signature, check if its a bound method" >> main.py
+            echo "        return hasattr(obj, '__self__')" >> main.py
+            echo "" >> main.py
+            echo 'def register_tools_from_instance(instance, prefix=""):' >> main.py
+            echo '    """Register all API methods from an instance as MCP tools."""' >> main.py
+            echo "    registered_count = 0" >> main.py
+            echo "    methods = [n for n in dir(instance) if not n.startswith('_')]" >> main.py
+            echo '    logger.info(f"Scanning {len(methods)} public attributes: {methods[:20]}...")' >> main.py
+            echo "    " >> main.py
+            echo "    for name in dir(instance):" >> main.py
+            echo "        try:" >> main.py
+            echo "            attr = getattr(instance, name)" >> main.py
+            echo "        except Exception as e:" >> main.py
+            echo '            logger.debug(f"Cannot get attr {name}: {e}")' >> main.py
+            echo "            continue" >> main.py
+            echo "        " >> main.py
+            echo "        if not is_api_method(attr, name):" >> main.py
+            echo "            continue" >> main.py
+            echo "        " >> main.py
+            echo "        try:" >> main.py
+            echo '            tool_name = f"{prefix}{name}" if prefix else name' >> main.py
+            echo "            " >> main.py
+            echo "            # Register the method directly - FastMCP will introspect its signature" >> main.py
+            echo "            mcp.tool(name=tool_name)(attr)" >> main.py
+            echo "            registered_count += 1" >> main.py
+            echo '            logger.info(f"Registered tool: {tool_name}")' >> main.py
+            echo "        except Exception as e:" >> main.py
+            echo '            logger.warning(f"Failed to register {name}: {e}")' >> main.py
+            echo "    return registered_count" >> main.py
+            echo "" >> main.py
+            echo "def discover_and_register_tools():" >> main.py
+            echo "    try:" >> main.py
+            echo "        client = get_client()" >> main.py
+            echo "        if client is None:" >> main.py
+            echo '            logger.warning("Could not initialize API client, using fallback tools only")' >> main.py
+            echo "            return" >> main.py
+            echo "        " >> main.py
+            echo "        registered_count = 0" >> main.py
+            echo "        " >> main.py
+            echo "        # If we have OpenAPI instances, register from all of them" >> main.py
+            echo "        if _all_api_instances:" >> main.py
+            echo "            for api_name, api_instance in _all_api_instances:" >> main.py
+            echo '                logger.info(f"Registering tools from OpenAPI class: {api_name}")' >> main.py
+            echo "                count = register_tools_from_instance(api_instance)" >> main.py
+            echo "                registered_count += count" >> main.py
+            echo "        else:" >> main.py
+            echo "            # Fall back to single client" >> main.py
+            echo "            registered_count = register_tools_from_instance(client)" >> main.py
+            echo "        " >> main.py
+            echo '        logger.info(f"Registered {registered_count} API tools total")' >> main.py
+            echo "    except Exception as e:" >> main.py
+            echo '        logger.error(f"Tool discovery failed: {e}, using fallback tools only")' >> main.py
+            echo "" >> main.py
+            echo "discover_and_register_tools()" >> main.py
+            echo "" >> main.py
+            echo "# Custom /tools endpoint using mcp.get_tools() API" >> main.py
+            echo "from starlette.requests import Request" >> main.py
+            echo "from starlette.responses import JSONResponse" >> main.py
+            echo "import asyncio" >> main.py
+            echo "import re" >> main.py
+            echo "" >> main.py
+            echo "@mcp.custom_route(\"/tools\", methods=[\"GET\"])" >> main.py
+            echo "async def list_tools_endpoint(request: Request):" >> main.py
+            echo "    try:" >> main.py
+            echo "        result = mcp.get_tools()" >> main.py
+            echo "        if asyncio.iscoroutine(result):" >> main.py
+            echo "            all_tools = await result" >> main.py
+            echo "        else:" >> main.py
+            echo "            all_tools = result" >> main.py
+            echo "        tools_info = []" >> main.py
+            echo "        def get_params(tool):" >> main.py
+            echo "            # Try multiple ways to access the schema" >> main.py
+            echo "            schema = None" >> main.py
+            echo "            for attr in ['inputSchema', 'input_schema', 'parameters', 'schema']:" >> main.py
+            echo "                s = getattr(tool, attr, None)" >> main.py
+            echo "                if s is not None:" >> main.py
+            echo "                    # Convert Pydantic models to dict" >> main.py
+            echo "                    if hasattr(s, 'model_dump'):" >> main.py
+            echo "                        schema = s.model_dump()" >> main.py
+            echo "                    elif hasattr(s, 'dict'):" >> main.py
+            echo "                        schema = s.dict()" >> main.py
+            echo "                    elif isinstance(s, dict):" >> main.py
+            echo "                        schema = s" >> main.py
+            echo "                    if schema:" >> main.py
+            echo "                        break" >> main.py
+            echo "            if not schema:" >> main.py
+            echo "                return []" >> main.py
+            echo "            props = schema.get('properties', {})" >> main.py
+            echo "            req = schema.get('required', [])" >> main.py
+            echo "            params = []" >> main.py
+            echo "            for k, v in props.items():" >> main.py
+            echo "                if not isinstance(v, dict):" >> main.py
+            echo "                    continue" >> main.py
+            echo "                param = {" >> main.py
+            echo "                    'name': k," >> main.py
+            echo "                    'type': v.get('type', 'any')," >> main.py
+            echo "                    'required': k in req," >> main.py
+            echo "                    'default': v.get('default')," >> main.py
+            echo "                    'description': v.get('description', '')," >> main.py
+            echo "                }" >> main.py
+            echo "                # Extract constraints" >> main.py
+            echo "                constraints = []" >> main.py
+            echo "                if 'minimum' in v: constraints.append(f\"Min: {v['minimum']}\") " >> main.py
+            echo "                if 'maximum' in v: constraints.append(f\"Max: {v['maximum']}\") " >> main.py
+            echo "                if 'minLength' in v: constraints.append(f\"Min length: {v['minLength']}\") " >> main.py
+            echo "                if 'maxLength' in v: constraints.append(f\"Max length: {v['maxLength']}\") " >> main.py
+            echo "                if 'pattern' in v: constraints.append(f\"Pattern: {v['pattern']}\") " >> main.py
+            echo "                if 'enum' in v: constraints.append(f\"Allowed: {v['enum']}\") " >> main.py
+            echo "                if 'format' in v: constraints.append(f\"Format: {v['format']}\") " >> main.py
+            echo "                param['constraints'] = ', '.join(constraints) if constraints else None" >> main.py
+            echo "                params.append(param)" >> main.py
+            echo "            return params" >> main.py
+            echo "        def clean_desc(d):" >> main.py
+            echo "            if not d: return 'No description'" >> main.py
+            echo "            lines = [l.strip() for l in d.split('\\n') if l.strip() and not l.strip().startswith(':param') and not l.strip().startswith(':type') and not l.strip().startswith(':return')]" >> main.py
+            echo "            return ' '.join(lines)[:300]" >> main.py
+            echo "        if isinstance(all_tools, dict):" >> main.py
+            echo "            for name, tool in all_tools.items():" >> main.py
+            echo "                tools_info.append({'name': getattr(tool, 'name', name), 'description': clean_desc(getattr(tool, 'description', '')), 'parameters': get_params(tool)})" >> main.py
+            echo "        else:" >> main.py
+            echo "            for tool in all_tools:" >> main.py
+            echo "                tools_info.append({'name': getattr(tool, 'name', ''), 'description': clean_desc(getattr(tool, 'description', '')), 'parameters': get_params(tool)})" >> main.py
+            echo "        return JSONResponse({'server': \"world-news-api-clients\", 'tool_count': len(tools_info), 'tools': tools_info})" >> main.py
+            echo "    except Exception as e:" >> main.py
+            echo '        logger.error(f"Error listing tools: {e}")' >> main.py
+            echo "        return JSONResponse({'server': \"world-news-api-clients\", 'error': str(e), 'tool_count': 0, 'tools': []}, status_code=500)" >> main.py
+            echo "" >> main.py
+            echo "@mcp.custom_route(\"/health\", methods=[\"GET\"])" >> main.py
+            echo "async def health_check(request: Request):" >> main.py
+            echo "    return JSONResponse({'status': 'healthy', 'server': \"world-news-api-clients\"})" >> main.py
+            echo "" >> main.py
+            echo "@mcp.custom_route(\"/tools/debug\", methods=[\"GET\"])" >> main.py
+            echo "async def debug_tools_endpoint(request: Request):" >> main.py
+            echo "    try:" >> main.py
+            echo "        result = mcp.get_tools()" >> main.py
+            echo "        if asyncio.iscoroutine(result):" >> main.py
+            echo "            all_tools = await result" >> main.py
+            echo "        else:" >> main.py
+            echo "            all_tools = result" >> main.py
+            echo "        debug_info = []" >> main.py
+            echo "        if isinstance(all_tools, dict):" >> main.py
+            echo "            for name, tool in all_tools.items():" >> main.py
+            echo "                tool_debug = {'name': name, 'attrs': dir(tool), 'type': str(type(tool))}" >> main.py
+            echo "                for attr in ['inputSchema', 'input_schema', 'parameters', 'schema', 'model']:" >> main.py
+            echo "                    val = getattr(tool, attr, None)" >> main.py
+            echo "                    if val is not None:" >> main.py
+            echo "                        if hasattr(val, 'model_dump'):" >> main.py
+            echo "                            tool_debug[attr] = val.model_dump()" >> main.py
+            echo "                        elif hasattr(val, 'dict'):" >> main.py
+            echo "                            tool_debug[attr] = val.dict()" >> main.py
+            echo "                        else:" >> main.py
+            echo "                            tool_debug[attr] = str(val)[:500]" >> main.py
+            echo "                debug_info.append(tool_debug)" >> main.py
+            echo "        else:" >> main.py
+            echo "            for tool in all_tools:" >> main.py
+            echo "                tool_debug = {'name': getattr(tool, 'name', ''), 'attrs': dir(tool), 'type': str(type(tool))}" >> main.py
+            echo "                for attr in ['inputSchema', 'input_schema', 'parameters', 'schema', 'model']:" >> main.py
+            echo "                    val = getattr(tool, attr, None)" >> main.py
+            echo "                    if val is not None:" >> main.py
+            echo "                        if hasattr(val, 'model_dump'):" >> main.py
+            echo "                            tool_debug[attr] = val.model_dump()" >> main.py
+            echo "                        elif hasattr(val, 'dict'):" >> main.py
+            echo "                            tool_debug[attr] = val.dict()" >> main.py
+            echo "                        else:" >> main.py
+            echo "                            tool_debug[attr] = str(val)[:500]" >> main.py
+            echo "                debug_info.append(tool_debug)" >> main.py
+            echo "        return JSONResponse({'tools': debug_info[:5]})" >> main.py
+            echo "    except Exception as e:" >> main.py
+            echo "        import traceback" >> main.py
+            echo "        return JSONResponse({'error': str(e), 'trace': traceback.format_exc()}, status_code=500)" >> main.py
+            echo "" >> main.py
+            echo 'if __name__ == "__main__":' >> main.py
+            echo "    import sys" >> main.py
+            echo "    " >> main.py
+            echo "    # Default to HTTP transport for Cloud Run (supports custom routes like /tools)" >> main.py
+            echo "    # Use SSE if explicitly requested, stdio for local testing" >> main.py
+            echo '    transport = "stdio"' >> main.py
+            echo '    if "--transport" in sys.argv:' >> main.py
+            echo "        idx = sys.argv.index('--transport')" >> main.py
+            echo "        if idx + 1 < len(sys.argv):" >> main.py
+            echo "            transport = sys.argv[idx + 1]" >> main.py
+            echo '    elif "PORT" in os.environ:' >> main.py
+            echo "        # Cloud Run environment - use streamable-http for production" >> main.py
+            echo '        transport = "streamable-http"' >> main.py
+            echo "    " >> main.py
+            echo '    if transport in ("streamable-http", "sse"):' >> main.py
+            echo '        port = int(os.environ.get("PORT", 8080))' >> main.py
+            echo '        logger.info(f"Starting FastMCP server with {transport} transport on port {port}")' >> main.py
+            echo '        mcp.run(transport=transport, host="0.0.0.0", port=port)' >> main.py
+            echo "    else:" >> main.py
+            echo '        logger.info("Starting FastMCP server with stdio transport")' >> main.py
+            echo "        mcp.run()" >> main.py
+            
+            echo "Generated main.py FastMCP wrapper"
+          fi
+          
+          # Generate or update requirements.txt
+          if [ -f "requirements.txt" ]; then
+            # Add FastMCP dependencies if not present
+            if ! grep -q "fastmcp" requirements.txt; then
+              echo "" >> requirements.txt
+              echo "# FastMCP wrapper dependencies" >> requirements.txt
+              echo "fastmcp[http]" >> requirements.txt
+              echo "starlette" >> requirements.txt
+              echo "uvicorn" >> requirements.txt
+            fi
+            # Add the target package if not present
+            if ! grep -q "worldnewsapi" requirements.txt; then
+              echo "worldnewsapi" >> requirements.txt
+            fi
+          elif [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+            # Source has setup.py/pyproject.toml - install package in editable mode
+            echo "# FastMCP wrapper dependencies" > requirements.txt
+            echo "fastmcp[http]" >> requirements.txt
+            echo "starlette" >> requirements.txt
+            echo "uvicorn" >> requirements.txt
+            echo "-e ." >> requirements.txt
+          else
+            # No dependency file - create requirements with FastMCP and target package
+            echo "# FastMCP wrapper dependencies" > requirements.txt
+            echo "fastmcp[http]" >> requirements.txt
+            echo "starlette" >> requirements.txt
+            echo "uvicorn" >> requirements.txt
+            echo "" >> requirements.txt
+            echo "# Target API package" >> requirements.txt
+            echo "worldnewsapi" >> requirements.txt
+          fi
+          
+          echo "Updated requirements.txt"
+          cat requirements.txt
+          
+          # Generate Dockerfile for Cloud Run
+          echo "FROM python:3.11-slim" > Dockerfile
+          echo "" >> Dockerfile
+          echo "WORKDIR /app" >> Dockerfile
+          echo "" >> Dockerfile
+          echo "# Install system dependencies" >> Dockerfile
+          echo "RUN apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*" >> Dockerfile
+          echo "" >> Dockerfile
+          echo "COPY requirements.txt ." >> Dockerfile
+          echo "RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt" >> Dockerfile
+          echo "" >> Dockerfile
+          echo "COPY . ." >> Dockerfile
+          echo "" >> Dockerfile
+          echo "ENV PORT=8080" >> Dockerfile
+          echo "ENV PYTHONUNBUFFERED=1" >> Dockerfile
+          echo "" >> Dockerfile
+          echo "EXPOSE 8080" >> Dockerfile
+          echo "" >> Dockerfile
+          echo 'CMD ["python", "main.py", "--transport", "streamable-http"]' >> Dockerfile
+          
+          echo "Generated Dockerfile for Cloud Run"
+          cat Dockerfile
+          
+          echo "=== FastMCP wrapper generation complete ==="
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: mcp-deployer@biomindtalks.iam.gserviceaccount.com
+          project_id: biomindtalks
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: biomindtalks
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: us-central1-docker.pkg.dev/biomindtalks/docker-images/nov29
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=world-news-api-clients
+            org.opencontainers.image.description=MCP Server: world-news-api-clients - Containerized deployment
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            API_KEY=${{ secrets.API_KEY }}
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: nov29
+          region: us-central1
+          image: us-central1-docker.pkg.dev/biomindtalks/docker-images/nov29:latest
+          flags: |
+            --port=8080
+            --memory=256Mi
+            --cpu=1
+            --max-instances=10
+            --min-instances=0
+            --timeout=3600
+            --allow-unauthenticated
+          env_vars: |
+            API_KEY=${{ secrets.API_KEY }}
+
+      - name: Discover MCP Tools
+        id: discover-tools
+        continue-on-error: true
+        run: |
+          SERVICE_URL="${{ steps.deploy.outputs.url }}"
+          TOOLS_ENDPOINT="$SERVICE_URL/tools"
+          
+          echo "Discovering tools from MCP server at $TOOLS_ENDPOINT..."
+          echo ""
+          
+          # Retry logic for Cloud Run cold starts (up to 5 attempts with backoff)
+          MAX_RETRIES=5
+          RETRY_DELAY=10
+          TOOLS_JSON=""
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i/$MAX_RETRIES: Fetching tools..."
+            
+            # Call the simple /tools endpoint (GET request)
+            HTTP_CODE=$(curl -s -o /tmp/tools_response.json -w "%{http_code}" \
+              -H "Accept: application/json" \
+              --max-time 30 \
+              "$TOOLS_ENDPOINT" 2>/dev/null || echo "000")
+            
+            RESPONSE=$(cat /tmp/tools_response.json 2>/dev/null || echo "")
+            
+            echo "HTTP Status: $HTTP_CODE"
+            
+            # Check if we got a valid JSON response with tools array
+            if [ "$HTTP_CODE" = "200" ] && echo "$RESPONSE" | jq -e '.tools' > /dev/null 2>&1; then
+              TOOLS_JSON="$RESPONSE"
+              echo "Successfully retrieved tools catalog!"
+              break
+            fi
+            
+            echo "Response: $RESPONSE"
+            
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Waiting $RETRY_DELAY seconds before retry (cold start may be in progress)..."
+              sleep $RETRY_DELAY
+              RETRY_DELAY=$((RETRY_DELAY + 5))
+            fi
+          done
+          
+          if [ -n "$TOOLS_JSON" ]; then
+            # Save full tools JSON for detailed display
+            echo "$TOOLS_JSON" > /tmp/tools_full.json
+            
+            TOOL_COUNT=$(echo "$TOOLS_JSON" | jq -r '.tool_count // (.tools | length) // 0')
+            
+            if [ "$TOOL_COUNT" -gt 0 ]; then
+              echo "TOOLS_DISCOVERED=true" >> $GITHUB_OUTPUT
+              echo "TOOL_COUNT=$TOOL_COUNT" >> $GITHUB_OUTPUT
+              
+              echo ""
+              echo "✅ Discovered $TOOL_COUNT MCP tools"
+              echo ""
+              # Show first 10 tools in console
+              echo "$TOOLS_JSON" | jq -r '.tools[:10][] | "  • \(.name): \(.description[:60] // "No description")..."' 2>/dev/null || true
+              [ "$TOOL_COUNT" -gt 10 ] && echo "  ... and $((TOOL_COUNT - 10)) more (see summary)"
+            else
+              echo "TOOLS_DISCOVERED=false" >> $GITHUB_OUTPUT
+              echo "TOOL_COUNT=0" >> $GITHUB_OUTPUT
+              echo "/tools endpoint returned empty tools array"
+            fi
+          else
+            # Fallback: Try JSON-RPC tools/list on /mcp endpoint (for SSE transport or older servers)
+            echo ""
+            echo "Trying JSON-RPC fallback on /mcp endpoint..."
+            RESPONSE=$(curl -s -X POST "$SERVICE_URL/mcp" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              --max-time 30 \
+              -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}' \
+              2>/dev/null || echo "")
+            
+            if echo "$RESPONSE" | jq -e '.result.tools' > /dev/null 2>&1; then
+              # Convert JSON-RPC response to same format as /tools endpoint
+              echo "$RESPONSE" | jq '{server: "mcp-server", tool_count: (.result.tools | length), tools: [.result.tools[] | {name: .name, description: (.description // "No description"), parameters: [(.inputSchema.properties // {}) | to_entries[] | {name: .key, type: (.value.type // "any"), required: ((.key as $k) | (.inputSchema.required // []) | contains([$k])), description: (.value.description // "")}]}]}' > /tmp/tools_full.json 2>/dev/null || true
+              TOOL_COUNT=$(echo "$RESPONSE" | jq -r '.result.tools | length // 0')
+              
+              if [ "$TOOL_COUNT" -gt 0 ]; then
+                echo "TOOLS_DISCOVERED=true" >> $GITHUB_OUTPUT
+                echo "TOOL_COUNT=$TOOL_COUNT" >> $GITHUB_OUTPUT
+                echo "Discovered $TOOL_COUNT MCP tools via JSON-RPC"
+              else
+                echo "TOOLS_DISCOVERED=false" >> $GITHUB_OUTPUT
+                echo "TOOL_COUNT=0" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "TOOLS_DISCOVERED=false" >> $GITHUB_OUTPUT
+              echo "TOOL_COUNT=0" >> $GITHUB_OUTPUT
+              echo "Could not retrieve tools catalog"
+              echo "You can manually test with:"
+              echo "  curl $TOOLS_ENDPOINT"
+              echo "  curl -X POST $SERVICE_URL/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}'"
+            fi
+          fi
+
+      - name: Save Deployment Data via Webhook
+        if: ${{ success() }}
+        continue-on-error: true
+        env:
+          WEBHOOK_URL: ${{ secrets.DEPLOYMENT_WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.DEPLOYMENT_WEBHOOK_TOKEN }}
+        run: |
+          SERVICE_URL="${{ steps.deploy.outputs.url }}"
+          
+          # Skip if no webhook configured
+          if [ -z "$WEBHOOK_URL" ] || [ -z "$WEBHOOK_TOKEN" ]; then
+            echo "No webhook configured, skipping deployment data sync"
+            exit 0
+          fi
+          
+          echo "Sending deployment data to webhook..."
+          
+          # Get discovered tools (may be empty)
+          TOOLS_JSON="[]"
+          if [ -f /tmp/tools_full.json ]; then
+            # Handle both formats: {tools: [...]} or raw array [...]
+            if jq -e 'type == "array"' /tmp/tools_full.json > /dev/null 2>&1; then
+              TOOLS_JSON=$(jq -c '.' /tmp/tools_full.json 2>/dev/null || echo "[]")
+            else
+              TOOLS_JSON=$(jq -c '.tools // []' /tmp/tools_full.json 2>/dev/null || echo "[]")
+            fi
+            echo "Tools to send to webhook: $(echo $TOOLS_JSON | jq length) items"
+          fi
+          
+          # Build MCP config
+          SERVICE_NAME="nov29"
+          MCP_CONFIG=$(cat <<EOF
+          {
+            "mcpServers": {
+              "$SERVICE_NAME": {
+                "url": "$SERVICE_URL/sse"
+              }
+            }
+          }
+          EOF
+          )
+          
+          # Build payload with actions run URL
+          ACTIONS_RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(jq -n \
+            --arg token "$WEBHOOK_TOKEN" \
+            --arg cloudRunUrl "$SERVICE_URL" \
+            --arg actionsRunUrl "$ACTIONS_RUN_URL" \
+            --argjson discoveredTools "$TOOLS_JSON" \
+            --argjson mcpConfig "$MCP_CONFIG" \
+            '{token: $token, cloudRunUrl: $cloudRunUrl, actionsRunUrl: $actionsRunUrl, discoveredTools: $discoveredTools, mcpConfig: $mcpConfig}')
+          
+          # Send to webhook
+          HTTP_CODE=$(curl -s -o /tmp/webhook_response.json -w "%{http_code}" \
+            -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            --max-time 30 2>/dev/null || echo "000")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Deployment data saved successfully"
+            cat /tmp/webhook_response.json | jq . 2>/dev/null || cat /tmp/webhook_response.json
+          else
+            echo "⚠️ Webhook returned HTTP $HTTP_CODE (non-fatal)"
+            cat /tmp/webhook_response.json 2>/dev/null || true
+          fi
+
+      - name: Show Cloud Run URL and MCP Configuration
+        env:
+          SERVICE_NAME: nov29
+          REGION: us-central1
+          PROJECT: biomindtalks
+          MEMORY: 256Mi
+          CPU: 1
+          MAX_INSTANCES: "10"
+          AUTH_TYPE: "Public (unauthenticated)"
+          IMAGE: us-central1-docker.pkg.dev/biomindtalks/docker-images/nov29:latest
+          TOOLS_DISCOVERED: ${{ steps.discover-tools.outputs.TOOLS_DISCOVERED }}
+          TOOL_COUNT: ${{ steps.discover-tools.outputs.TOOL_COUNT }}
+        run: |
+          SERVICE_URL="${{ steps.deploy.outputs.url }}"
+          echo "Service URL: $SERVICE_URL"
+          
+          {
+            echo "# 🚀 Cloud Run Deployment Successful"
+            echo ""
+            echo "## 📋 Deployment Details"
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| **Service Name** | \`$SERVICE_NAME\` |"
+            echo "| **Region** | \`$REGION\` |"
+            echo "| **Project** | \`$PROJECT\` |"
+            echo "| **Memory** | \`$MEMORY\` |"
+            echo "| **CPU** | \`$CPU\` |"
+            echo "| **Max Instances** | \`$MAX_INSTANCES\` |"
+            echo "| **Authentication** | \`$AUTH_TYPE\` |"
+            echo ""
+            echo "## 🔗 URLs"
+            echo "| Endpoint | URL |"
+            echo "|----------|-----|"
+            echo "| **Service URL** | <$SERVICE_URL> |"
+            echo "| **MCP Endpoint** | <$SERVICE_URL/mcp> |"
+            echo "| **Tools Endpoint** | <$SERVICE_URL/tools> |"
+            echo "| **Health Check** | <$SERVICE_URL/health> |"
+            echo ""
+            
+            # Show discovered tools with industry-standard API documentation format
+            if [ "$TOOLS_DISCOVERED" = "true" ] && [ -f /tmp/tools_full.json ]; then
+              echo "## 🛠️ API Reference ($TOOL_COUNT Tools)"
+              echo ""
+              echo "This MCP server exposes the following tools:"
+              echo ""
+              
+              # Quick reference table with parameter counts
+              echo "### Quick Reference"
+              echo ""
+              echo "| # | Tool | Parameters | Required |"
+              echo "|---|------|------------|----------|"
+              jq -r '.tools | to_entries | .[] | "| " + ((.key + 1) | tostring) + " | " + .value.name + " | " + ((.value.parameters // []) | length | tostring) + " | " + ((.value.parameters // []) | map(select(.required)) | length | tostring) + " |"' /tmp/tools_full.json 2>/dev/null || echo "| | _Error loading tools_ | | |"
+              echo ""
+              
+              # Detailed documentation for each tool with parameter tables
+              echo "### Detailed Tool Documentation"
+              echo ""
+              
+              # Generate comprehensive per-tool documentation using jq
+              TOOL_COUNT_INT=$(jq '.tools | length' /tmp/tools_full.json 2>/dev/null || echo "0")
+              for idx in $(seq 0 $((TOOL_COUNT_INT < 20 ? TOOL_COUNT_INT - 1 : 19))); do
+                TOOL_NAME=$(jq -r '.tools['$idx'].name // "Unknown"' /tmp/tools_full.json)
+                TOOL_DESC=$(jq -r '.tools['$idx'].description // "No description available."' /tmp/tools_full.json)
+                PARAM_COUNT=$(jq '.tools['$idx'].parameters | length' /tmp/tools_full.json 2>/dev/null || echo "0")
+                REQ_COUNT=$(jq '[.tools['$idx'].parameters[] | select(.required == true)] | length' /tmp/tools_full.json 2>/dev/null || echo "0")
+                OPT_COUNT=$((PARAM_COUNT - REQ_COUNT))
+                
+                echo "---"
+                echo ""
+                echo "#### $((idx + 1)). $TOOL_NAME"
+                echo ""
+                echo "$TOOL_DESC"
+                echo ""
+                
+                if [ "$PARAM_COUNT" -gt 0 ]; then
+                  echo "**Parameters:** $PARAM_COUNT total ($REQ_COUNT required, $OPT_COUNT optional)"
+                  echo ""
+                  echo "| Parameter | Type | Required | Default | Description | Constraints |"
+                  echo "|-----------|------|----------|---------|-------------|-------------|"
+                  jq -r '.tools['$idx'].parameters[] | "| " + .name + " | " + (.type // "any") + " | " + (if .required then "YES" else "NO" end) + " | " + (if .default == null then "—" elif .default == "" then "\"\"" else (.default | tostring)[0:30] end) + " | " + ((.description // "")[0:100]) + " | " + (.constraints // "—") + " |"' /tmp/tools_full.json 2>/dev/null
+                  echo ""
+                else
+                  echo "_No parameters required._"
+                  echo ""
+                fi
+              done
+              
+              if [ "$TOOL_COUNT_INT" -gt 20 ]; then
+                echo ""
+                echo "> _Showing first 20 tools. Visit /tools endpoint for complete list._"
+                echo ""
+              fi
+              echo ""
+            else
+              echo "## 🛠️ API Reference"
+              echo ""
+              echo "> Tools will be discovered at runtime. Visit the \`/tools\` endpoint or connect to \`/mcp\` to see available tools."
+              echo ""
+            fi
+            
+            echo "## ☁️ Google Cloud Console"
+            echo "| Resource | Link |"
+            echo "|----------|------|"
+            echo "| **Cloud Run Service** | [View in Console](https://console.cloud.google.com/run/detail/$REGION/$SERVICE_NAME?project=$PROJECT) |"
+            echo "| **Container Logs** | [View Logs](https://console.cloud.google.com/logs/query?project=$PROJECT&resource.type=cloud_run_revision&resource.labels.service_name=$SERVICE_NAME) |"
+            echo "| **Artifact Registry** | [View Image](https://console.cloud.google.com/artifacts/docker/$PROJECT/$REGION/docker-images/nov29?project=$PROJECT) |"
+            echo ""
+            echo "## 📦 Container Image"
+            echo "\`\`\`"
+            echo "$IMAGE"
+            echo "\`\`\`"
+            echo ""
+            echo "## 🔧 MCP Client Configuration"
+            echo ""
+            echo "### Claude Desktop / Cursor / MCP Clients"
+            echo "Add this to your MCP client configuration:"
+            echo "\`\`\`json"
+            echo "{"
+            echo "  \"mcpServers\": {"
+            echo "    \"$SERVICE_NAME\": {"
+            echo "      \"url\": \"$SERVICE_URL/mcp\""
+            echo "    }"
+            echo "  }"
+            echo "}"
+            echo "\`\`\`"
+            echo ""
+            echo "## 🧪 Test Commands"
+            echo ""
+            echo "### List Available Tools"
+            echo "Fetch the tools catalog from the /tools endpoint:"
+            echo "\`\`\`bash"
+            echo "curl \"$SERVICE_URL/tools\""
+            echo "\`\`\`"
+            echo ""
+            echo "### Health Check"
+            echo "Verify the server is running:"
+            echo "\`\`\`bash"
+            echo "curl \"$SERVICE_URL/health\""
+            echo "\`\`\`"
+            echo ""
+            echo "### Call tools/list via MCP Protocol"
+            echo "Use the MCP JSON-RPC endpoint:"
+            echo "\`\`\`bash"
+            echo "curl -X POST \"$SERVICE_URL/mcp\" -H \"Content-Type: application/json\" -d '{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"params\":{},\"id\":1}'"
+            echo "\`\`\`"
+            echo ""
+            echo "## ⚙️ Connection Settings"
+            echo ""
+            echo "| Setting | Value | Description |"
+            echo "|---------|-------|-------------|"
+            echo "| **Request Timeout** | 3600s (1 hour) | Maximum connection duration before timeout |"
+            echo "| **Protocol** | Streamable HTTP | Use POST requests to /mcp endpoint |"
+            echo ""
+            echo "> **Note:** This server uses FastMCP HTTP transport with the /mcp endpoint. MCP clients can connect directly."
+            echo ""
+            echo "## 🔐 Security Best Practices"
+            echo ""
+            echo "**Important:** If you passed API keys or tokens as environment variables, they may appear in Cloud Run logs."
+            echo ""
+            echo "For production deployments, use **Google Secret Manager** instead:"
+            echo ""
+            echo "\`\`\`bash"
+            echo "# Create a secret"
+            echo "echo -n \"your-token\" | gcloud secrets create GITLAB_ACCESS_TOKEN --data-file=-"
+            echo ""
+            echo "# Grant Cloud Run access"
+            echo "gcloud secrets add-iam-policy-binding GITLAB_ACCESS_TOKEN \\\\"
+            echo "  --member=\"serviceAccount:$PROJECT-compute@developer.gserviceaccount.com\" \\\\"
+            echo "  --role=\"roles/secretmanager.secretAccessor\""
+            echo ""
+            echo "# Update service to use secret"
+            echo "gcloud run services update $SERVICE_NAME --region=$REGION \\\\"
+            echo "  --update-secrets=GITLAB_ACCESS_TOKEN=GITLAB_ACCESS_TOKEN:latest"
+            echo "\`\`\`"
+          } >> $GITHUB_STEP_SUMMARY
